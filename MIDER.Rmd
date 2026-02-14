@@ -1,0 +1,338 @@
+```{r}
+
+
+# ==============================================================================
+# BƯỚC 0: CÀI ĐẶT VÀ LOAD THƯ VIỆN
+# ==============================================================================
+required_packages <- c("readxl", "dplyr", "gtools", "stringr")
+new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+
+library(readxl)
+library(dplyr)
+library(gtools)
+library(stringr)
+
+# ==============================================================================
+# BƯỚC 1: ĐỌC VÀ LÀM SẠCH DỮ LIỆU
+# ==============================================================================
+
+file_path <- "data.xlsx" 
+
+# 1. Đọc file mà KHÔNG ép kiểu text toàn bộ (để R tự nhận diện cột Ngày là Date)
+raw_data <- read_excel(file_path)
+
+
+# Xử lý dữ liệu
+df_clean <- raw_data %>%
+  # Chuẩn hóa lại Date
+  mutate(Time = as.Date(Time, format = "%m/%d/%Y")) %>%
+  # Sắp xếp lại theo thời gian tăng dần
+  arrange(Time)
+
+# 2. Xử lý các cột giá (Loại bỏ dấu phẩy nếu có và chuyển thành số)
+# Lấy danh sách tên các mã cổ phiếu (trừ cột Ngày)
+# Lấy tất cả tên cột
+all_cols <- colnames(df_clean)
+
+# Chỉ lấy những cột KHÔNG PHẢI là "Ngày" VÀ KHÔNG PHẢI là "STT"
+stock_names <- setdiff(all_cols, c("Time"))
+for (col in stock_names) {
+  # Kiểm tra nếu cột đó đang là dạng character (do dính dấu phẩy) thì mới xử lý
+  if (is.character(df_clean[[col]])) {
+    df_clean[[col]] <- as.numeric(gsub(",", "", df_clean[[col]]))
+  }
+}
+
+# Tách riêng ma trận giá để tính toán cho Bước sau
+price_matrix <- df_clean[, stock_names]
+
+price_matrix
+
+# ==============================================================================
+# BƯỚC 2: RỜI RẠC HÓA DỮ LIỆU (DISCRETIZATION)
+# ==============================================================================
+# Entropy cần dữ liệu dạng nhóm (bins). Ta dùng phương pháp "equal frequency"
+# (chia đều tần suất) hoặc "equal width". Ở đây dùng thư viện infotheo hoặc code thủ công.
+# Để đơn giản và không phụ thuộc thư viện lạ, ta viết hàm chia bin thủ công (ví dụ: 10 bins).
+
+price_to_return <- function(p) {
+  diff(log(p))
+}
+
+return_matrix <- as.data.frame(lapply(price_matrix, price_to_return))
+
+discretize_quantile <- function(x, num_bins = 8) {
+
+  qs <- quantile(x, probs = seq(0,1,length.out=num_bins+1),
+                 na.rm=TRUE)
+
+  qs <- unique(qs)
+
+  if(length(qs) < 3) {
+    return(rep(1, length(x)))
+  }
+
+  cut(x, breaks=qs, include.lowest=TRUE, labels=FALSE)
+}
+
+
+data_discrete <- as.data.frame(
+  lapply(return_matrix, discretize_quantile, num_bins = 8)
+)
+
+
+# ==============================================================================
+# BƯỚC 3: ĐỊNH NGHĨA CÁC HÀM TÍNH ENTROPY
+# ==============================================================================
+
+# 1. Hàm tính Shannon Entropy H(X)
+calc_entropy <- function(x) {
+  freq <- table(x) / length(x)
+  -sum(freq * log2(freq))
+}
+
+# 2. Hàm tính Joint Entropy H(X, Y)
+calc_joint_entropy <- function(df_cols) {
+  # df_cols là data frame chứa các cột cần tính joint entropy
+  # Nối các cột lại để tạo thành một biến tổ hợp
+  if (ncol(df_cols) == 1) return(calc_entropy(df_cols[,1]))
+  
+  # Tạo bảng tần suất kết hợp
+  freq <- table(df_cols) / nrow(df_cols)
+  # Loại bỏ các giá trị 0 để tránh lỗi log2(0)
+  freq <- freq[freq > 0]
+  -sum(freq * log2(freq))
+}
+
+# 3. Hàm tính Conditional Entropy H(Y | X_set)
+# Công thức: H(Y | X) = H(Y, X) - H(X)
+calc_cond_entropy <- function(target_vec, conditioner_df) {
+  # Nếu tập điều kiện rỗng, trả về H(Target)
+  if (is.null(conditioner_df) || ncol(conditioner_df) == 0) {
+    return(calc_entropy(target_vec))
+  }
+  
+  h_joint_yx <- calc_joint_entropy(cbind(as.data.frame(conditioner_df), target_val = target_vec))
+  h_joint_x  <- calc_joint_entropy(as.data.frame(conditioner_df))
+  
+  return(h_joint_yx - h_joint_x)
+}
+
+# ==============================================================================
+# BƯỚC 4: TÍNH TOÁN MUTUAL INFORMATION & TÌM LAG TỐI ƯU (BƯỚC 1 CỦA MIDER)
+# ==============================================================================
+
+# ==============================================================================
+# BƯỚC BỔ SUNG: ĐỊNH NGHĨA CÁC HÀM HỖ TRỢ (CHẠY PHẦN NÀY TRƯỚC)
+# ==============================================================================
+
+# 1. Hàm tạo dữ liệu trễ (Lag)
+# Hàm này dịch chuyển vector xuống k dòng. Ví dụ: k=1 là lấy giá hôm qua.
+get_lagged_vector <- function(x, lag) {
+  if (lag == 0) return(x)
+  c(rep(NA, lag), x[1:(length(x)-lag)])
+}
+
+# Hàm tính Mutual Information I(X, Y)
+# I(X, Y) = H(X) + H(Y) - H(X, Y)
+calc_mutual_info <- function(x, y) {
+  h_x <- calc_entropy(x)
+  h_y <- calc_entropy(y)
+  
+  # Tạo dataframe chung để tính H(X, Y)
+  df_joint <- data.frame(x = x, y = y)
+  df_joint <- na.omit(df_joint) # Xử lý NA do lag
+  
+  if (nrow(df_joint) == 0) return(0)
+  
+  # Tính lại entropy đơn trên tập dữ liệu đã loại NA (để đồng bộ)
+  h_x_clean <- calc_entropy(df_joint$x)
+  h_y_clean <- calc_entropy(df_joint$y)
+  h_xy <- calc_joint_entropy(df_joint)
+  
+  return(h_x_clean + h_y_clean - h_xy)
+}
+
+# --- THỰC HIỆN QUÉT LAG VÀ TẠO MA TRẬN MI ---
+MAX_LAG <- 5 # Số ngày trễ tối đa muốn xét
+
+# Ma trận lưu trữ kết quả
+n_stocks <- length(stock_names)
+mi_matrix <- matrix(0, nrow = n_stocks, ncol = n_stocks, dimnames = list(stock_names, stock_names))
+lag_matrix <- matrix(0, nrow = n_stocks, ncol = n_stocks, dimnames = list(stock_names, stock_names))
+
+print("--- BẮT ĐẦU TÍNH MI MATRIX & TÌM LAG TỐI ƯU ---")
+
+for (i in 1:n_stocks) {
+  target <- stock_names[i]
+  y_vec <- data_discrete[[target]]
+  
+  for (j in 1:n_stocks) {
+    if (i == j) next # Bỏ qua chính nó
+    
+    candidate <- stock_names[j]
+    cand_vec <- data_discrete[[candidate]]
+    
+    max_mi <- -1
+    best_lag <- 0
+    
+    # Quét qua các độ trễ để tìm MI lớn nhất (theo công thức 14)
+    for (lag in 0:MAX_LAG) {
+      x_lagged <- get_lagged_vector(cand_vec, lag)
+      
+      # Tính MI
+      mi_val <- calc_mutual_info(x_lagged, y_vec)
+      
+      if (mi_val > max_mi) {
+        max_mi <- mi_val
+        best_lag <- lag
+      }
+    }
+    
+    # Lưu lại MI lớn nhất và Lag tương ứng
+    mi_matrix[target, candidate] <- max_mi
+    lag_matrix[target, candidate] <- best_lag
+  }
+}
+
+# In kết quả sơ bộ (Top các cặp có quan hệ mạnh nhất theo MI)
+print("Các cặp có quan hệ mạnh nhất (dựa trên MI & Lag tối ưu):")
+# Chuyển ma trận thành danh sách cạnh để dễ xem
+edges <- as.data.frame(as.table(mi_matrix))
+colnames(edges) <- c("Target", "Source", "MI")
+edges <- edges[edges$MI > 0, ]
+edges$Lag <- mapply(function(t, s) lag_matrix[t, s], edges$Target, edges$Source)
+# Sắp xếp giảm dần theo MI
+edges <- edges[order(-edges$MI), ]
+head(edges, 10)
+
+lag_matrix
+
+# ==============================================================================
+# BƯỚC 5: ENTROPY REDUCTION (DÙNG LAG ĐÃ TÌM ĐƯỢC Ở BƯỚC 4)
+# ==============================================================================
+
+network_structure <- list()
+
+print("--- CHẠY ENTROPY REDUCTION (LOẠI BỎ GIÁN TIẾP) ---")
+
+for (target_name in stock_names) {
+  
+  # 1. Tính ngưỡng K Adaptive dựa trên Max MI đã tính ở trên
+  # (Lưu ý: Max ER xấp xỉ Max Normalized MI)
+  # Lấy dòng tương ứng với target trong ma trận MI
+  mi_values <- mi_matrix[target_name, ]
+  # Chuẩn hóa MI để ước lượng ER (chia cho Entropy của Target)
+  h_target <- calc_entropy(data_discrete[[target_name]])
+  er_estimates <- mi_values / h_target
+  
+  # Tính ngưỡng K
+  # Bỏ self MI
+  er_estimates <- er_estimates[is.finite(er_estimates) & er_estimates > 0]
+
+  if (length(er_estimates) == 0) {
+    threshold_K <- 0
+  } else {
+    threshold_K <- quantile(er_estimates, 0.75)
+  }
+
+  
+  cat(paste("Target:", target_name, "| Threshold K:", round(threshold_K, 3), "\n"))
+  
+  # 2. Quy trình chọn biến (Dựa trên Lag đã cố định từ bước MI)
+  selected_vars <- c()
+  candidates <- setdiff(stock_names, target_name)
+  
+  # Sắp xếp ứng viên theo MI giảm dần (để ưu tiên xét thằng mạnh trước)
+  cand_mi <- mi_values[candidates]
+  candidates <- candidates[order(cand_mi, decreasing = TRUE)]
+  
+  # Entropy ban đầu (chưa biết gì)
+  Y_original <- data_discrete[[target_name]]
+  current_cond_H <- h_target
+  
+  for (iter in 1:3) { # Giới hạn m=2 vòng lặp
+    best_cand <- NULL
+    max_er_gain <- -1
+    
+    for (cand in candidates) {
+      # Lấy Lag tối ưu đã tìm được ở Bước 4
+      opt_lag <- lag_matrix[target_name, cand]
+      cand_data <- data_discrete[[cand]]
+      X_opt <- get_lagged_vector(cand_data, opt_lag)
+      
+      # Tạo dataframe kết hợp: Y + Selected + Candidate mới
+      combine_list <- list(Y = Y_original, CAND = X_opt)
+      
+      # Thêm các biến đã chọn (với lag tối ưu của chúng)
+      if (length(selected_vars) > 0) {
+        for (sel in selected_vars) {
+          sel_lag <- lag_matrix[target_name, sel]
+          combine_list[[sel]] <- get_lagged_vector(data_discrete[[sel]], sel_lag)
+        }
+      }
+      
+      df_calc <- as.data.frame(combine_list)
+      df_calc <- na.omit(df_calc)
+      
+      if (nrow(df_calc) == 0) next
+      
+      # Tính Entropy: H(Y | Selected) vs H(Y | Selected + Cand)
+      # Tính lại H_old trên tập dữ liệu bị cắt này
+      if (length(selected_vars) == 0) {
+        H_old <- calc_entropy(df_calc$Y)
+      } else {
+        cols_sel <- setdiff(names(df_calc), c("Y", "CAND"))
+        H_old <- calc_cond_entropy(df_calc$Y, df_calc[, cols_sel, drop=FALSE])
+      }
+      
+      cols_new <- setdiff(names(df_calc), "Y")
+      H_new <- calc_cond_entropy(df_calc$Y, df_calc[, cols_new, drop=FALSE])
+      
+      # Tính ER Gain thực tế
+      # Chuẩn hóa bằng Entropy cục bộ để chính xác
+      er_gain <- (H_old - H_new) / calc_entropy(df_calc$Y)
+      
+      if (er_gain > max_er_gain) {
+        max_er_gain <- er_gain
+        best_cand <- cand
+      }
+    }
+    
+    # Kiểm tra điều kiện dừng
+    if (!is.null(best_cand) && max_er_gain > threshold_K) {
+      selected_vars <- c(selected_vars, best_cand)
+      candidates <- setdiff(candidates, best_cand)
+      opt_lag_val <- lag_matrix[target_name, best_cand]
+      
+      cat(paste("  --> Chọn:", best_cand, "(Lag", opt_lag_val, ")- Gain:", round(max_er_gain, 4), "\n"))
+    } else {
+      break
+    }
+  }
+  
+  if (length(selected_vars) > 0) {
+    # Lưu kết quả kèm Lag
+    res_str <- sapply(selected_vars, function(v) paste0(v, "(Lag ", lag_matrix[target_name, v], ")"))
+    network_structure[[target_name]] <- res_str
+  }
+}
+
+edge_list <- data.frame()
+
+for (target in names(network_structure)) {
+  
+  parents_clean <- gsub("\\(Lag.*\\)", "", network_structure[[target]])
+  
+  for (src in parents_clean) {
+    edge_list <- rbind(edge_list,
+                       data.frame(Target=target, Source=src))
+  }
+}
+
+print(edge_list)
+
+
+```
+
